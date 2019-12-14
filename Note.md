@@ -1191,3 +1191,743 @@ void editorRefreshScreen() {
 ```
 
 在`editorRefreshScreen()`中，我们首先通过分配`ABUF_INIT`来初始化一个名为`ab`的新`abuf`。然后，我们用`abAppend(&ab,...)`替换每次出现的`write(STDOUT_FILENO,...)`。我们还将`ab`传递给`editorDrawRows()`，因此它也可以使用`abAppend（）`。最后，我们将缓冲区的内容`write()`到标准输出中，并释放`abuf`使用的内存。
+
+###  重绘时隐藏光标 
+
+烦人的闪烁效果还有另一个可能的来源，我们现在要解决。终端绘制到屏幕时，光标可能会在屏幕中间的某处显示一秒钟。为了确保不会发生这种情况，请在刷新屏幕之前先隐藏光标，然后在刷新完成后立即再次显示。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+void editorDrawRows(struct abuf *ab) { … }
+void editorRefreshScreen() {
+  struct abuf ab = ABUF_INIT;
+  abAppend(&ab, "\x1b[?25l", 6);
+  abAppend(&ab, "\x1b[2J", 4);
+  abAppend(&ab, "\x1b[H", 3);
+  editorDrawRows(&ab);
+  abAppend(&ab, "\x1b[H", 3);
+  abAppend(&ab, "\x1b[?25h", 6);
+  write(STDOUT_FILENO, ab.b, ab.len);
+  abFree(&ab);
+}
+/*** input ***/
+/*** init ***/
+```
+
+我们使用转义序列来告诉终端隐藏并显示光标。`h`和`l`命令（设置模式，复位模式）用于打开和关闭各种终端功能或“模式”。 刚刚链接到的《 VT100用户指南》并未记录我们上面使用的参数`?25`。在以后的VT模型中出现了光标隐藏/显示功能。因此，某些终端可能不支持隐藏/显示光标，但是如果不支持，则它们只会忽略这些转义序列，在这种情况下，这没什么大不了的。 
+
+### 一次清除一行
+
+与其在每次刷新之前清除整个屏幕，不如在重新绘制它们时清除每一行似乎更为理想。让我们删除`<esc> [2J`（清除整个屏幕）转义序列，然后在我们绘制的每行末尾放置一个`<esc> [K`序列。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+void editorDrawRows(struct abuf *ab) {
+  int y;
+  for (y = 0; y < E.screenrows; y++) {
+    abAppend(ab, "~", 1);
+    abAppend(ab, "\x1b[K", 3);
+    if (y < E.screenrows - 1) {
+      abAppend(ab, "\r\n", 2);
+    }
+  }
+}
+void editorRefreshScreen() {
+  struct abuf ab = ABUF_INIT;
+  abAppend(&ab, "\x1b[?25l", 6);
+  abAppend(&ab, "\x1b[2J", 4);
+  abAppend(&ab, "\x1b[H", 3);
+  editorDrawRows(&ab);
+  abAppend(&ab, "\x1b[H", 3);
+  abAppend(&ab, "\x1b[?25h", 6);
+  write(STDOUT_FILENO, ab.b, ab.len);
+  abFree(&ab);
+}
+/*** input ***/
+/*** init ***/
+```
+
+`K`命令（在线擦除）擦除当前行的一部分。 其参数类似于`J`命令的参数：`2`擦除整行，`1`擦除光标左侧的行的一部分，`0`擦除光标右侧的行的一部分。  `0`是默认参数，这就是我们想要的，因此我们省略该参数，而只使用`<esc> [K`。 
+
+### 欢迎信息
+
+也许是时候显示欢迎信息了。让我们在屏幕下方三分之一处显示编辑器的名称和版本号。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+#define KILO_VERSION "0.0.1"
+#define CTRL_KEY(k) ((k) & 0x1f)
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+void editorDrawRows(struct abuf *ab) {
+  int y;
+  for (y = 0; y < E.screenrows; y++) {
+    if (y == E.screenrows / 3) {
+      char welcome[80];
+      int welcomelen = snprintf(welcome, sizeof(welcome),
+        "Kilo editor -- version %s", KILO_VERSION);
+      if (welcomelen > E.screencols) welcomelen = E.screencols;
+      abAppend(ab, welcome, welcomelen);
+    } else {
+      abAppend(ab, "~", 1);
+    }
+    abAppend(ab, "\x1b[K", 3);
+    if (y < E.screenrows - 1) {
+      abAppend(ab, "\r\n", 2);
+    }
+  }
+}
+void editorRefreshScreen() { … }
+/*** input ***/
+/*** init ***/
+```
+
+`snprintf()`来自`<stdio.h>`.
+
+我们使用`welcome`缓冲区和`snprintf()`将`KILO_VERSION`字符串插入到欢迎消息中。如果终端太小而无法容纳我们的欢迎信息，我们还将截断字符串的长度。 
+
+下面来居中它：
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+void editorDrawRows(struct abuf *ab) {
+  int y;
+  for (y = 0; y < E.screenrows; y++) {
+    if (y == E.screenrows / 3) {
+      char welcome[80];
+      int welcomelen = snprintf(welcome, sizeof(welcome),
+        "Kilo editor -- version %s", KILO_VERSION);
+      if (welcomelen > E.screencols) welcomelen = E.screencols;
+      int padding = (E.screencols - welcomelen) / 2;
+      if (padding) {
+        abAppend(ab, "~", 1);
+        padding--;
+      }
+      while (padding--) abAppend(ab, " ", 1);
+      abAppend(ab, welcome, welcomelen);
+    } else {
+      abAppend(ab, "~", 1);
+    }
+    abAppend(ab, "\x1b[K", 3);
+    if (y < E.screenrows - 1) {
+      abAppend(ab, "\r\n", 2);
+    }
+  }
+}
+void editorRefreshScreen() { … }
+/*** input ***/
+/*** init ***/
+```
+
+要使字符串居中，请将屏幕宽度除以`2`，然后从中减去`字符串长度的一半`。换句话说：`E.screencols / 2-welcomelen / 2`，简化为`(E.screencols-welcomelen)/ 2`。它告诉您应该从屏幕的左边缘开始打印多行。因此，我们用空格字符填充该空间，但第一个字符除外，第一个字符应为~。
+
+### 移动光标
+
+现在让我们专注于输入。我们希望用户能够移动光标。第一步是在全局编辑器状态下跟踪光标的`x`和`y`位置。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+struct editorConfig {
+  int cx, cy;
+  int screenrows;
+  int screencols;
+  struct termios orig_termios;
+};
+struct editorConfig E;
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+/*** init ***/
+void initEditor() {
+  E.cx = 0;
+  E.cy = 0;
+  if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+}
+int main() { … }
+```
+
+`E.cx`是光标的水平坐标（列），`E.cy`是垂直坐标（行）。我们希望将它们都初始化为`0`，因为我们希望光标从屏幕的左上角开始。（由于C语言使用从0开始的索引，因此我们将尽可能使用0索引的值。）
+
+现在，将代码添加到`editorRefreshScreen()`中，以将光标移动到`E.cx`和`E.cy`中存储的位置。
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+void editorDrawRows(struct abuf *ab) { … }
+void editorRefreshScreen() {
+  struct abuf ab = ABUF_INIT;
+  abAppend(&ab, "\x1b[?25l", 6);
+  abAppend(&ab, "\x1b[H", 3);
+  editorDrawRows(&ab);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+  abAppend(&ab, buf, strlen(buf));
+  abAppend(&ab, "\x1b[?25h", 6);
+  write(STDOUT_FILENO, ab.b, ab.len);
+  abFree(&ab);
+}
+/*** input ***/
+/*** init ***/
+```
+
+我们将旧的`H`命令更改为带有参数的`H`命令，指定了我们希望光标移动到的确切位置。（请确保您删除了旧的H命令）
+
+我们在`E.cy`和`E.cx`上加1，以将`0`索引值转换为终端使用的`1`索引值。
+
+此时，您可以尝试将`E.cx`初始化为`10`或类似的值，或者将`E.cx ++`插入主循环中，以确认代码到目前为止是否可以正常工作。
+
+接下来，我们将允许用户使用wasd键移动光标。（如果您不熟悉将这些键用作箭头键：w是向上箭头，s是向下箭头，a是左箭头，d是右箭头。）
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+void editorMoveCursor(char key) {
+  switch (key) {
+    case 'a':
+      E.cx--;
+      break;
+    case 'd':
+      E.cx++;
+      break;
+    case 'w':
+      E.cy--;
+      break;
+    case 's':
+      E.cy++;
+      break;
+  }
+}
+void editorProcessKeypress() {
+  char c = editorReadKey();
+  switch (c) {
+    case CTRL_KEY('q'):
+      write(STDOUT_FILENO, "\x1b[2J", 4);
+      write(STDOUT_FILENO, "\x1b[H", 3);
+      exit(0);
+      break;
+    case 'w':
+    case 's':
+    case 'a':
+    case 'd':
+      editorMoveCursor(c);
+      break;
+  }
+}
+/*** init ***/
+```
+
+ 现在，应该能够使用这些键在光标周围移动。
+
+### 方向键
+
+ 现在，我们有了一种映射按键来移动光标的方法，让我们用箭头键替换wasd键。  在上一章中，我们看到按箭头键会将多个字节作为输入发送到我们的程序。 这些字节采用转义序列的形式，以`'\ x1b'`，`'['`，然后是`'A'`，`'B'`，`'C'`或`'D'`开头，具体取决于四个箭头键中的哪个按下。让我们修改`editorReadKey()`以一次按下该键即可读取这种形式的转义序列。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+void die(const char *s) { … }
+void disableRawMode() { … }
+void enableRawMode() { … }
+char editorReadKey() {
+  int nread;
+  char c;
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN) die("read");
+  }
+  if (c == '\x1b') {
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+    if (seq[0] == '[') {
+      switch (seq[1]) {
+        case 'A': return 'w';
+        case 'B': return 's';
+        case 'C': return 'd';
+        case 'D': return 'a';
+      }
+    }
+    return '\x1b';
+  } else {
+    return c;
+  }
+}
+int getCursorPosition(int *rows, int *cols) { … }
+int getWindowSize(int *rows, int *cols) { … }
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+/*** init ***/
+```
+
+如果读取转义字符，则立即将另外两个字节读取到`seq`缓冲区中。如果这些读取中的任何一个超时（在0.1秒后），那么我们假定用户只是按下了`Escape`键并返回该键。否则，我们将查看转义序列是否为箭头键转义序列。如果是的话，我们暂时返回相应的`wasd`字符。如果不是我们识别出的转义序列，我们只需返回转义字符。 
+
+我们将`seq`缓冲区设置为`3`个字节长，因为将来我们将处理更长的转义序列。 
+
+我们基本上已经将箭头键别名化为wasd键。这样可以使箭头键立即工作，但将wasd键仍映射到`editorMoveCursor()`函数。我们想要的是`editorReadKey()`为每个箭头键返回特殊值，以使我们能够确定已按下特定的箭头键。 
+
+首先，用常数`ARROW_UP`，`ARROW_LEFT`，`ARROW_DOWN`和`ARROW_RIGHT`替换wasd字符的每个实例。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+#define KILO_VERSION "0.0.1"
+#define CTRL_KEY(k) ((k) & 0x1f)
+enum editorKey {
+  ARROW_LEFT = 'a',
+  ARROW_RIGHT = 'd',
+  ARROW_UP = 'w',
+  ARROW_DOWN = 's'
+};
+/*** data ***/
+/*** terminal ***/
+void die(const char *s) { … }
+void disableRawMode() { … }
+void enableRawMode() { … }
+char editorReadKey() {
+  int nread;
+  char c;
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN) die("read");
+  }
+  if (c == '\x1b') {
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+    if (seq[0] == '[') {
+      switch (seq[1]) {
+        case 'A': return ARROW_UP;
+        case 'B': return ARROW_DOWN;
+        case 'C': return ARROW_RIGHT;
+        case 'D': return ARROW_LEFT;
+      }
+    }
+    return '\x1b';
+  } else {
+    return c;
+  }
+}
+int getCursorPosition(int *rows, int *cols) { … }
+int getWindowSize(int *rows, int *cols) { … }
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+void editorMoveCursor(char key) {
+  switch (key) {
+    case ARROW_LEFT:
+      E.cx--;
+      break;
+    case ARROW_RIGHT:
+      E.cx++;
+      break;
+    case ARROW_UP:
+      E.cy--;
+      break;
+    case ARROW_DOWN:
+      E.cy++;
+      break;
+  }
+}
+void editorProcessKeypress() {
+  char c = editorReadKey();
+  switch (c) {
+    case CTRL_KEY('q'):
+      write(STDOUT_FILENO, "\x1b[2J", 4);
+      write(STDOUT_FILENO, "\x1b[H", 3);
+      exit(0);
+      break;
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+      editorMoveCursor(c);
+      break;
+  }
+}
+/*** init ***/
+```
+
+现在，我们只需要在`editorKey`枚举中选择与`wasd`不冲突的箭头键表示即可。我们将为他们提供一个大的整数值，该值超出了`char`的范围，这样它们就不会与任何普通的按键冲突。我们还必须将所有存储按键的变量更改为`int`类型而不是`char`类型。 
+
+```c
+arrow-keys-int
+/*** includes ***/
+/*** defines ***/
+#define KILO_VERSION "0.0.1"
+#define CTRL_KEY(k) ((k) & 0x1f)
+enum editorKey {
+  ARROW_LEFT = 1000,
+  ARROW_RIGHT,
+  ARROW_UP,
+  ARROW_DOWN
+};
+/*** data ***/
+/*** terminal ***/
+void die(const char *s) { … }
+void disableRawMode() { … }
+void enableRawMode() { … }
+int editorReadKey() {
+  int nread;
+  char c;
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN) die("read");
+  }
+  if (c == '\x1b') {
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+    if (seq[0] == '[') {
+      switch (seq[1]) {
+        case 'A': return ARROW_UP;
+        case 'B': return ARROW_DOWN;
+        case 'C': return ARROW_RIGHT;
+        case 'D': return ARROW_LEFT;
+      }
+    }
+    return '\x1b';
+  } else {
+    return c;
+  }
+}
+int getCursorPosition(int *rows, int *cols) { … }
+int getWindowSize(int *rows, int *cols) { … }
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+void editorMoveCursor(int key) {
+  switch (key) {
+    case ARROW_LEFT:
+      E.cx--;
+      break;
+    case ARROW_RIGHT:
+      E.cx++;
+      break;
+    case ARROW_UP:
+      E.cy--;
+      break;
+    case ARROW_DOWN:
+      E.cy++;
+      break;
+  }
+}
+void editorProcessKeypress() {
+  int c = editorReadKey();
+  switch (c) {
+    case CTRL_KEY('q'):
+      write(STDOUT_FILENO, "\x1b[2J", 4);
+      write(STDOUT_FILENO, "\x1b[H", 3);
+      exit(0);
+      break;
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+      editorMoveCursor(c);
+      break;
+  }
+}
+/*** init ***/
+```
+
+通过将枚举中的第一个常数设置为`1000`，其余常数将获得递增值`1001`、`1002`、`1003`，依此类推。
+
+### 防止光标超出屏幕
+
+当前，您可以使`E.cx`和`E.cy`值变为负值，或者超过屏幕的右边缘和下边缘。让我们通过在`editorMoveCursor()`中进行一些边界检查来避免这种情况。
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+void editorMoveCursor(int key) {
+  switch (key) {
+    case ARROW_LEFT:
+      if (E.cx != 0) {
+        E.cx--;
+      }
+      break;
+    case ARROW_RIGHT:
+      if (E.cx != E.screencols - 1) {
+        E.cx++;
+      }
+      break;
+    case ARROW_UP:
+      if (E.cy != 0) {
+        E.cy--;
+      }
+      break;
+    case ARROW_DOWN:
+      if (E.cy != E.screenrows - 1) {
+        E.cy++;
+      }
+      break;
+  }
+}
+void editorProcessKeypress() { … }
+/*** init ***/
+```
+
+### `Page Up`和`Page Down`
+
+为了完成我们的底层终端代码，我们需要检测更多使用转义序列的特殊按键，如箭头键一样。我们将从Page Up和Page Down键开始。Page Up发送为`<esc> [5〜`，Page Down发送为`<esc> [6〜`。
+
+ ```c
+/*** includes ***/
+/*** defines ***/
+#define KILO_VERSION "0.0.1"
+#define CTRL_KEY(k) ((k) & 0x1f)
+enum editorKey {
+  ARROW_LEFT = 1000,
+  ARROW_RIGHT,
+  ARROW_UP,
+  ARROW_DOWN,
+  PAGE_UP,
+  PAGE_DOWN
+};
+/*** data ***/
+/*** terminal ***/
+void die(const char *s) { … }
+void disableRawMode() { … }
+void enableRawMode() { … }
+int editorReadKey() {
+  int nread;
+  char c;
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN) die("read");
+  }
+  if (c == '\x1b') {
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+    if (seq[0] == '[') {
+      if (seq[1] >= '0' && seq[1] <= '9') {
+        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+        if (seq[2] == '~') {
+          switch (seq[1]) {
+            case '5': return PAGE_UP;
+            case '6': return PAGE_DOWN;
+          }
+        }
+      } else {
+        switch (seq[1]) {
+          case 'A': return ARROW_UP;
+          case 'B': return ARROW_DOWN;
+          case 'C': return ARROW_RIGHT;
+          case 'D': return ARROW_LEFT;
+        }
+      }
+    }
+    return '\x1b';
+  } else {
+    return c;
+  }
+}
+int getCursorPosition(int *rows, int *cols) { … }
+int getWindowSize(int *rows, int *cols) { … }
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+/*** init ***/
+ ```
+
+现在您了解了为什么我们声明`seq`能够存储`3个字节`。如果`[`后面的字节是数字，我们读取另一个字节，期望它是`〜`。然后，我们测试数字字节以查看它是`5`还是`6`。
+
+让我们让Page Up和Page Down做点什么。目前，我们将让他们将光标移动到屏幕顶部或屏幕底部。 
+
+```c
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+void editorMoveCursor(int key) { … }
+void editorProcessKeypress() {
+  int c = editorReadKey();
+  switch (c) {
+    case CTRL_KEY('q'):
+      write(STDOUT_FILENO, "\x1b[2J", 4);
+      write(STDOUT_FILENO, "\x1b[H", 3);
+      exit(0);
+      break;
+    case PAGE_UP:
+    case PAGE_DOWN:
+      {
+        int times = E.screenrows;
+        while (times--)
+          editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+      }
+      break;
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+      editorMoveCursor(c);
+      break;
+  }
+}
+/*** init ***/
+```
+
+我们使用一对大括号创建一个代码块，以便我们可以声明`times`变量。（您不能在switch语句中直接声明变量。）我们模拟用户按下↑或↓键足够多的时间以移至屏幕顶部或底部。当我们实现滚动时，以这种方式实现Page Up和Page Down将使我们以后变得更加容易。 
+
+ 如果您使用带Fn键的笔记本电脑，则可以按Fn +↑和Fn +↓来模拟按Page Up和Page Down键。 
+
+### `Home`和`END`键
+
+现在，实现Home和End键。与先前的键一样，这些键也发送转义序列。与以前的键不同，这些键可以发送许多不同的转义序列，具体取决于您的操作系统或终端仿真器。
+
+ Home键可以作为`<esc> [1〜`，`<esc> [7〜`，`<esc> [H`或`<esc> OH]`发送。类似地，End键可以作为`<esc> [4〜`，`<esc> [8〜`，`<esc> [F`或`<esc> OF]`发送。让我们处理所有这些情况。  
+
+```c
+/*** includes ***/
+/*** defines ***/
+#define KILO_VERSION "0.0.1"
+#define CTRL_KEY(k) ((k) & 0x1f)
+enum editorKey {
+  ARROW_LEFT = 1000,
+  ARROW_RIGHT,
+  ARROW_UP,
+  ARROW_DOWN,
+  HOME_KEY,
+  END_KEY,
+  PAGE_UP,
+  PAGE_DOWN
+};
+/*** data ***/
+/*** terminal ***/
+void die(const char *s) { … }
+void disableRawMode() { … }
+void enableRawMode() { … }
+int editorReadKey() {
+  int nread;
+  char c;
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN) die("read");
+  }
+  if (c == '\x1b') {
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+    if (seq[0] == '[') {
+      if (seq[1] >= '0' && seq[1] <= '9') {
+        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+        if (seq[2] == '~') {
+          switch (seq[1]) {
+            case '1': return HOME_KEY;
+            case '4': return END_KEY;
+            case '5': return PAGE_UP;
+            case '6': return PAGE_DOWN;
+            case '7': return HOME_KEY;
+            case '8': return END_KEY;
+          }
+        }
+      } else {
+        switch (seq[1]) {
+          case 'A': return ARROW_UP;
+          case 'B': return ARROW_DOWN;
+          case 'C': return ARROW_RIGHT;
+          case 'D': return ARROW_LEFT;
+          case 'H': return HOME_KEY;
+          case 'F': return END_KEY;
+        }
+      }
+    } else if (seq[0] == 'O') {
+      switch (seq[1]) {
+        case 'H': return HOME_KEY;
+        case 'F': return END_KEY;
+      }
+    }
+    return '\x1b';
+  } else {
+    return c;
+  }
+}
+int getCursorPosition(int *rows, int *cols) { … }
+int getWindowSize(int *rows, int *cols) { … }
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+/*** init ***/
+```
+
+ 现在，让Home和End做些事情。现在，让他们将光标移动到屏幕的左边缘或右边缘。 
+
+```
+/*** includes ***/
+/*** defines ***/
+/*** data ***/
+/*** terminal ***/
+/*** append buffer ***/
+/*** output ***/
+/*** input ***/
+void editorMoveCursor(int key) { … }
+void editorProcessKeypress() {
+  int c = editorReadKey();
+  switch (c) {
+    case CTRL_KEY('q'):
+      write(STDOUT_FILENO, "\x1b[2J", 4);
+      write(STDOUT_FILENO, "\x1b[H", 3);
+      exit(0);
+      break;
+    case HOME_KEY:
+      E.cx = 0;
+      break;
+    case END_KEY:
+      E.cx = E.screencols - 1;
+      break;
+    case PAGE_UP:
+    case PAGE_DOWN:
+      {
+        int times = E.screenrows;
+        while (times--)
+          editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+      }
+      break;
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+      editorMoveCursor(c);
+      break;
+  }
+}
+/*** init ***/
+```
+
